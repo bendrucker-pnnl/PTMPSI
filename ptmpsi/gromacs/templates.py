@@ -741,6 +741,38 @@ export GMX_MAXBACKUP=-1
 set -eo pipefail
 """
 
+slurm_header['Perlmutter'] = """#!/bin/bash
+#SBATCH --account={account}
+#SBATCH --qos={partition}
+#SBATCH --constraint={constraint}
+#SBATCH --image=docker:nersc/gromacs:23.2
+#SBATCH --time={time}
+#SBATCH --nodes={nnodes}
+#SBATCH --ntasks-per-node={ntasks}
+#SBATCH --cpus-per-task={nthreads}
+{gpuline}
+#SBATCH --job-name={jname}
+#SBATCH --error={jname}-%j.err
+#SBATCH --output={jname}-%j.out
+
+# From the user
+{user}
+
+# Keep Perlmutter's Default Cray PrgEnv intact (do not strip PrgEnv/cray-mpich)
+if ! command -v module >/dev/null 2>&1; then
+  source /etc/profile.d/modules.sh
+fi
+module load python >/dev/null 2>&1 || true
+
+export OMP_NUM_THREADS=${{SLURM_CPUS_PER_TASK}}
+export OMP_PROC_BIND=spread
+export OMP_PLACES=threads
+export GMX_MAXBACKUP=-1
+{gpu_env}
+# A failed GROMACS step ends the job as FAILED instead of COMPLETED
+set -eo pipefail
+"""
+
 flux_header = {}
 
 flux_header['Frontier'] = """#!/bin/bash

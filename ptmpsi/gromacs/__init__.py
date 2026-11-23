@@ -108,8 +108,13 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
     slurm = Slurm("gromacs", jobname=jobname, **kwargs)
     if slurm.machine.name == "DECEPTION" and slurm.ngpus > 0:
         raise ValueError("GROMACS on Deception is CPU only; use the 'shared', 'slurm' or 'short' partition")
-    gmx       = kwargs.pop("gmx", "gmx")
-    container = kwargs.pop("container", "")
+    default_gmx = "gmx_mpi" if slurm.machine.name == "Perlmutter" else "gmx"
+    default_container = (
+        ("shifter --module=cuda-mpich" if slurm.ngpus > 0 else "shifter --module=mpich")
+        if slurm.machine.name == "Perlmutter" else ""
+    )
+    gmx       = kwargs.pop("gmx", default_gmx)
+    container = kwargs.pop("container", default_container)
     bundling = kwargs.get("bundling", False)
     if slurm.machine.name == "Polaris":
         # gpu_id = kwargs.pop("gpu_tasks", "")
@@ -131,6 +136,9 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
     elif slurm.machine.name == "DECEPTION":
         # cores of a shared-node job can span two sockets, which binding to cores with PE>1 rejects
         mpirun    = kwargs.pop("mpirun", f"mpirun -np {slurm.ncpus} --bind-to none")
+    elif slurm.machine.name == "Perlmutter":
+        default_pm_mpirun = "srun --cpu-bind=cores --gpu-bind=none" if slurm.ngpus > 0 else "srun --cpu-bind=cores"
+        mpirun    = kwargs.pop("mpirun", default_pm_mpirun)
     else:
         mpirun    = kwargs.pop("mpirun", f"mpirun -np {slurm.ncpus}")
     nstlist   = kwargs.pop("nstlist", 0)
@@ -138,7 +146,7 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
     do_ti     = kwargs.get("thermo", True)
     subindex  = kwargs.pop("subindex", "")
     checkpointing = kwargs.pop("checkpointing", True)
-    default_max_md_runs = 1 if slurm.machine.name == "DECEPTION" else None
+    default_max_md_runs = 1 if slurm.machine.name in ("DECEPTION", "Perlmutter") else None
     max_md_runs = kwargs.pop("max_md_runs", default_max_md_runs)
     if max_md_runs is not None:
         max_md_runs = int(max_md_runs)
@@ -165,6 +173,14 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
         sed="| sed 's/Submitted batch job //'"
         self_jobid = "$SLURM_JOBID"
     auto_submit_ti = kwargs.get("auto_submit_ti", True)
+    if slurm.machine.name == "Perlmutter" and slurm.partition == "debug" and (
+        (checkpointing and max_md_runs != 0) or (do_ti and auto_submit_ti and max_md_runs != 0)
+    ):
+        raise ValueError(
+            "Perlmutter 'debug' QOS bans job chaining (--dependency=afterok); "
+            "use 'shared', 'regular', or 'preempt' for chained MD/TI, or pass "
+            "thermo=False, checkpointing=False, max_md_runs=0 for a single debug setup job"
+        )
 
     if conc is None and (npos is None or nneg is None):
         raise KeyError("Specify total ion concentration or a number of positive and negative ions to add")
@@ -175,6 +191,8 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
         single_mpiexec = "flux run -n 1" if bundling else "srun -n 1"
     elif slurm.machine.name == "Polaris":
         single_mpiexec = "mpiexec -n 1"
+    elif slurm.machine.name == "Perlmutter":
+        single_mpiexec = ""
     else:
         single_mpiexec = "mpirun -np 1"
 
@@ -242,7 +260,9 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
 
         # RUN RESTRAINED HEATING
         fh.write(f"{single_mpiexec} {container} {gmx} grompp -f heating.mdp -c minim{int(posres[-1])}.gro -r minim{int(posres[-1])}.gro -p topol.top -n index.ndx -o heating.tpr\n")
-        if slurm.ngpus > 1:
+        if slurm.machine.name == "Perlmutter" and slurm.ngpus >= 1:
+            fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm heating \n")
+        elif slurm.ngpus > 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -pme gpu -npme 1 -bonded gpu -update gpu -deffnm heating \n")
         elif slurm.ngpus == 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm heating \n")
@@ -251,7 +271,9 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
 
         # RUN RESTRAINED NPT
         fh.write(f"{single_mpiexec} {container} {gmx} grompp -f npt.mdp -c heating.gro -t heating.cpt -r heating.gro -p topol.top -n index.ndx -o npt.tpr\n")
-        if slurm.ngpus > 1:
+        if slurm.machine.name == "Perlmutter" and slurm.ngpus >= 1:
+            fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm npt \n")
+        elif slurm.ngpus > 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -pme gpu -npme 1 -bonded gpu -update gpu -deffnm npt \n")
         elif slurm.ngpus == 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm npt \n")
@@ -268,7 +290,9 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
 
         # RUN FREE HEATING
         fh.write(f"{single_mpiexec} {container} {gmx} grompp -f fheating.mdp -c minim.gro  -p topol.top -n index.ndx -o fheating.tpr\n")
-        if slurm.ngpus > 1:
+        if slurm.machine.name == "Perlmutter" and slurm.ngpus >= 1:
+            fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm fheating \n")
+        elif slurm.ngpus > 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -pme gpu -npme 1 -bonded gpu -update gpu -deffnm fheating \n")
         elif slurm.ngpus == 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm fheating \n")
@@ -278,7 +302,9 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
 
         # RUN FREE NPT
         fh.write(f"{single_mpiexec} {container} {gmx} grompp -f fnpt.mdp -c fheating.gro -t fheating.cpt -p topol.top -n index.ndx -o fnpt.tpr\n")
-        if slurm.ngpus > 1:
+        if slurm.machine.name == "Perlmutter" and slurm.ngpus >= 1:
+            fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm fnpt \n")
+        elif slurm.ngpus > 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -pme gpu -npme 1 -bonded gpu -update gpu -deffnm fnpt \n")
         elif slurm.ngpus == 1:
             fh.write(f"{mpirun}{subindex} {container} {gmx} mdrun {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm fnpt \n")
@@ -306,7 +332,9 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
             checkpoint_arg = ""
             maxh = ""
 
-        if slurm.ngpus > 1:
+        if slurm.machine.name == "Perlmutter" and slurm.ngpus >= 1:
+            md_cmd = f"{mpirun}{subindex} {container} {gmx} mdrun {checkpoint_arg} {maxh} {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm md \n"
+        elif slurm.ngpus > 1:
             md_cmd = f"{mpirun}{subindex} {container} {gmx} mdrun {checkpoint_arg} {maxh} {gpu_id} {nstlist} -nb gpu -pme gpu -npme 1 -bonded gpu -update gpu -deffnm md \n"
         elif slurm.ngpus == 1:
             md_cmd = f"{mpirun}{subindex} {container} {gmx} mdrun {checkpoint_arg} {maxh} {gpu_id} {nstlist} -nb gpu -bonded gpu -deffnm md \n"
@@ -341,8 +369,8 @@ def generate_slurm(infile, posres=[1000.0,500.0,100.0,50.0,10.0,5.0,1.0],
         subprocess.run(["chmod", "+x", run_script])
 
     if do_ti:
-        # Deception GROMACS has no GPU support; every other machine keeps "-nb gpu"
-        lam_gpu = "" if slurm.machine.name == "DECEPTION" else "-nb gpu"
+        # Deception GROMACS and Perlmutter CPU jobs have no GPUs; GPU runs keep "-nb gpu"
+        lam_gpu = "" if (slurm.machine.name == "DECEPTION" or slurm.ngpus == 0) else "-nb gpu"
         for i in range(13):
             lam_filename = f"{infile[:-4]}_lam{i:02d}.sh" if slurm.machine.name == "Polaris" else f"{infile[:-4]}_lam{i:02d}_slurm.sbatch"
             ipath = os.path.join(path, f"lam-{i:02d}")

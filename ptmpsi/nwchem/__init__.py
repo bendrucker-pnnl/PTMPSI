@@ -318,9 +318,9 @@ python -m pip install numpy'''
         infile.write("\npython modseminario.py\n")
         infile.write("\ndeactivate\n")
         # The torsion scan setup (proxy, git clone, container image) is specific to Tahoma
-        tdrive_in_script = dotorsions and single and slurm.machine.name != "DECEPTION"
+        tdrive_in_script = dotorsions and single and slurm.machine.name not in ("DECEPTION", "Perlmutter")
         if dotorsions and single and not tdrive_in_script:
-            print("\t Warning: torsion scans are not added to the Deception job script")
+            print(f"\t Warning: torsion scans are not added to the {slurm.machine.name} job script")
         if tdrive_in_script:
             infile.write(slurm_tdrive.format(scratch=slurm.scratch))
         infile.write("\n")

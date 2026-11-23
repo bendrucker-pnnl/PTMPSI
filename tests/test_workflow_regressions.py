@@ -465,16 +465,20 @@ class LocalScripts(unittest.TestCase):
                         '  gmx mdrun -deffnm minim']
             for launcher in ('srun -n 2', 'mpirun -np 2', 'mpiexec -n 2', 'flux run -n 2'):
                 commands.append(f'{launcher} apptainer exec --nv image gmx_mpi mdrun -gpu_id 0 -nb gpu -pme gpu -npme 1 -bonded gpu -update gpu -deffnm npt')
-            commands += ["sed -i '/; Include water topology/i #ifdef P1000' topol.top",
-                         'gmx grompp -f md.mdp -o   md.tpr', 'gmx mdrun -deffnm md']
+            commands += [
+                'srun --cpu-bind=cores --gpu-bind=none shifter --module=cuda-mpich gmx_mpi mdrun -nb gpu -bonded gpu -deffnm heating',
+                "sed -i '/; Include water topology/i #ifdef P1000' topol.top",
+                'shifter --module=mpich gmx_mpi grompp -f md.mdp -o   md.tpr',
+                'gmx mdrun -deffnm md',
+            ]
             Path('input.sbatch').write_text('\n'.join(commands))
             result = subprocess.run([sys.executable, str(SCRIPTS / 'localize_sbatch.py'),
                                      'input.sbatch'], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('echo SOL | gmx genion', result.stdout)
-            self.assertEqual(result.stdout.count('gmx mdrun'), 5)
+            self.assertEqual(result.stdout.count('gmx mdrun'), 6)
             self.assertIn('perl -0pi', result.stdout)
-            for removed in ('apptainer', 'gpu', 'mpirun', 'srun', '-nsteps', '-deffnm md'):
+            for removed in ('apptainer', 'shifter', 'gpu', 'mpirun', 'srun', '-nsteps', '-deffnm md'):
                 self.assertNotIn(removed, result.stdout)
             Path('input.sbatch').write_text('gmx mdrun -deffnm minim\n')
             failure = subprocess.run([sys.executable, str(SCRIPTS / 'localize_sbatch.py'),
@@ -524,6 +528,96 @@ class LocalScripts(unittest.TestCase):
             self.assertEqual(missing.returncode, 1)
             self.assertIn('python3', missing.stderr)
             self.assertIn('Programs on PATH:', missing.stdout)
+
+    def test_perlmutter_scripts_shifter_qos_constraints_and_guards(self):
+        slurm = runpy.run_path(str(ROOT / 'ptmpsi/slurm/__init__.py'))
+        templates = SimpleNamespace(**runpy.run_path(str(ROOT / 'ptmpsi/gromacs/templates.py')))
+        generator = definitions(ROOT / 'ptmpsi/gromacs/__init__.py', {'generate_slurm'},
+                                Slurm=slurm['Slurm'], subprocess=subprocess,
+                                **vars(templates)).generate_slurm
+        machine = slurm['perlmutter']
+
+        # GPU shared job (1 GPU, 32 logical CPUs)
+        gpu_opts = machine.partitions['shared'].options['gromacs']
+        with scratch() as directory, patch.dict(sys.modules, {'ptmpsi.gromacs.templates': templates}):
+            for i in range(13):
+                (directory / f'dualti/lam-{i:02d}').mkdir(parents=True, exist_ok=True)
+            generator('0000.pdb', conc=0.154, thermo=True, checkpointing=True,
+                      machine=machine, partition='shared', account='m5477_g', time=1, **gpu_opts)
+            setup = (directory / '0000_slurm.sbatch').read_text()
+            md_script = (directory / 'md.sbatch').read_text()
+            lam0 = (directory / 'dualti/lam-00/0000_lam00_slurm.sbatch').read_text()
+        self.assertIn('#SBATCH --account=m5477_g\n#SBATCH --qos=shared\n#SBATCH --constraint=gpu', setup)
+        self.assertIn('#SBATCH --image=docker:nersc/gromacs:23.2', setup)
+        self.assertIn('#SBATCH --gpus-per-node=1', setup)
+        self.assertIn('export GMX_ENABLE_DIRECT_GPU_COMM=true', setup)
+        self.assertIn('srun --cpu-bind=cores --gpu-bind=none shifter --module=cuda-mpich gmx_mpi mdrun   -nb gpu -bonded gpu -deffnm npt', setup)
+        self.assertIn('shifter --module=cuda-mpich gmx_mpi grompp -f md.mdp', setup)
+        self.assertIn('max_md_runs=1', setup)
+        self.assertNotIn('-pme gpu', setup + md_script + lam0)
+        self.assertNotIn('--gres=gpu:', setup)
+        self.assertNotIn('module purge', setup)
+        self.assertIn('-nb gpu -deffnm lam-00', lam0)
+
+        # CPU regular job (-C cpu, no GPU flags)
+        cpu_opts = machine.partitions['cpu_regular'].options['gromacs']
+        with scratch() as directory, patch.dict(sys.modules, {'ptmpsi.gromacs.templates': templates}):
+            for i in range(13):
+                (directory / f'dualti/lam-{i:02d}').mkdir(parents=True, exist_ok=True)
+            generator('0000.pdb', conc=0.154, thermo=True, checkpointing=False,
+                      machine=machine, partition='cpu_regular', account='m5477', time=1, **cpu_opts)
+            cpu_setup = (directory / '0000_slurm.sbatch').read_text()
+            cpu_lam0 = (directory / 'dualti/lam-00/0000_lam00_slurm.sbatch').read_text()
+        self.assertIn('#SBATCH --account=m5477\n#SBATCH --qos=regular\n#SBATCH --constraint=cpu', cpu_setup)
+        self.assertIn('srun --cpu-bind=cores shifter --module=mpich gmx_mpi mdrun -deffnm npt', cpu_setup)
+        for absent in ('--gpus-per-node', 'GMX_ENABLE_DIRECT_GPU_COMM', '-nb gpu', 'module purge'):
+            self.assertNotIn(absent, cpu_setup + cpu_lam0)
+
+        # Standalone debug job (no chaining) succeeds; chained debug job and missing account fail
+        debug_opts = dict(machine.partitions['cpu_debug'].options['gromacs'], ntasks=1, nthreads=16)
+        with scratch() as directory, patch.dict(sys.modules, {'ptmpsi.gromacs.templates': templates}):
+            generator('0000.pdb', conc=0.154, thermo=False, checkpointing=False,
+                      machine=machine, partition='cpu_debug', account='m5477', time=0.25, **debug_opts)
+            debug_setup = (directory / '0000_slurm.sbatch').read_text()
+            syn = subprocess.run(['/bin/bash', '-n', str(directory / '0000_slurm.sbatch')], capture_output=True, text=True)
+            self.assertEqual(syn.returncode, 0, syn.stderr)
+            self.assertNotIn('sbatch', debug_setup)
+            self.assertIn('gmx_mpi mdrun   -deffnm md', debug_setup)
+            with self.assertRaises(ValueError):
+                generator('0000.pdb', conc=0.154, thermo=False, checkpointing=True,
+                          machine=machine, partition='cpu_debug', account='m5477', time=0.25, **debug_opts)
+            for bad_account in ({}, {'account': ''}, {'account': 'XXXX'}):
+                with self.assertRaises(ValueError):
+                    generator('0000.pdb', conc=0.154, thermo=False, checkpointing=False,
+                              machine=machine, partition='cpu_debug', time=0.25, **debug_opts, **bad_account)
+
+    def test_perlmutter_nwchem_template_and_gen_ptm_files(self):
+        nwchem = runpy.run_path(str(ROOT / 'ptmpsi/nwchem/templates.py'))
+        slurm = runpy.run_path(str(ROOT / 'ptmpsi/slurm/__init__.py'))
+        header = nwchem['slurm_header']['Perlmutter'].format(
+            account='m5477', partition='regular', constraint='cpu', time='01:00:00',
+            nnodes=1, ntasks=16, nthreads=1, gpuline='', jname='nw_pm',
+            scratch='$SCRATCH', user='',
+        )
+        self.assertIn('#SBATCH --qos=regular\n#SBATCH --constraint=cpu', header)
+        self.assertIn('#SBATCH --image=ghcr.io/nwchemgit/nwchem-720.nersc.mpich4.mpi-pr:latest', header)
+        self.assertNotIn('module purge', header)
+        self.assertIn('shifter --module=mpich nwchem conf0.nw', nwchem['runsingularity']['Perlmutter'].format(name='conf0'))
+        self.assertIn('/opt/nwchem/src/data/amber_s/', nwchem['qmmm_slurm']['Perlmutter'])
+        self.assertIn('shifter --module=mpich nwchem prepare.nw', nwchem['qmmm_slurm']['Perlmutter'])
+
+        from ptmpsi.protein import Protein
+        from ptmpsi.slurm import perlmutter
+        with scratch() as directory:
+            protein = Protein()
+            protein.prepend('A', 'ALA')
+            with self.assertRaises(ValueError):
+                protein.gen_ptm_files([[()]], path=directory, pdb2pqr=False, machine=perlmutter,
+                                      partition='shared', conc=0.154, time=0.5, combination_logging=False)
+            with self.assertRaises(ValueError):
+                protein.gen_ptm_files([[()]], path=directory, pdb2pqr=False, machine=perlmutter,
+                                      partition='debug', account='m5477_g', conc=0.154, time=0.25,
+                                      combination_logging=False)
 
 
 if __name__ == '__main__':

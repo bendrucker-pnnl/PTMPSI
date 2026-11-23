@@ -484,11 +484,11 @@ class Protein:
         raw_machine = machine
         machine = get_machine_name(machine)
         machine = machine.capitalize()
-        if machine == "Deception":
+        if machine in ("Deception", "Perlmutter"):
             acct = kwargs.get("account", getattr(raw_machine, "account", None))
             if acct is None or not str(acct).strip() or str(acct).strip() == "XXXX":
                 raise ValueError(
-                    "Deception requires an explicit Slurm account (pass account='<project>'); 'XXXX' is not allowed"
+                    f"{machine} requires an explicit Slurm account (pass account='<project>'); 'XXXX' is not allowed"
                 )
 
         if machine == "Polaris":
@@ -499,14 +499,22 @@ class Protein:
             submit_cmd = "sbatch"
             dependency = "--dependency"
             sed = "| sed 's/Submitted batch job //'"
-        max_md_runs = kwargs.get("max_md_runs", 1 if machine == "Deception" else None)
+        max_md_runs = kwargs.get("max_md_runs", 1 if machine in ("Deception", "Perlmutter") else None)
         if max_md_runs is not None:
             max_md_runs = int(max_md_runs)
             if max_md_runs < 0:
                 raise ValueError(f"max_md_runs must be >= 0 or None, got {max_md_runs}")
         auto_submit_ti = do_ti and kwargs.get("auto_submit_ti", True) and max_md_runs != 0
-        
+
         checkpointing = kwargs.get("checkpointing", True)
+        if machine == "Perlmutter" and kwargs.get("partition") in ("debug", "cpu_debug") and (
+            (checkpointing and max_md_runs != 0) or auto_submit_ti
+        ):
+            raise ValueError(
+                "Perlmutter 'debug' QOS bans job chaining (--dependency=afterok); "
+                "use 'shared', 'regular', or 'preempt' for chained MD/TI, or pass "
+                "thermo=False, checkpointing=False, max_md_runs=0 for a single debug setup job"
+            )
 
         bundling = kwargs.get("bundling", False)
         jobtime_hours = kwargs.get("time", 12) - 0.2

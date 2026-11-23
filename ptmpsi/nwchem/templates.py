@@ -291,6 +291,52 @@ mkdir -p {scratch}/${{USER}}/${{SLURM_JOB_ID}}
 cd {scratch}/${{USER}}/${{SLURM_JOB_ID}}
 """
 
+slurm_header["Perlmutter"] = """#!/bin/bash
+#SBATCH --account={account}
+#SBATCH --qos={partition}
+#SBATCH --constraint={constraint}
+#SBATCH --image=ghcr.io/nwchemgit/nwchem-720.nersc.mpich4.mpi-pr:latest
+#SBATCH --time={time}
+#SBATCH --nodes={nnodes}
+#SBATCH --ntasks-per-node={ntasks}
+#SBATCH --cpus-per-task={nthreads}
+{gpuline}
+#SBATCH --job-name={jname}
+#SBATCH --error={jname}-%j.err
+#SBATCH --output={jname}-%j.out
+
+# From the user
+{user}
+
+cleanup()
+{{
+local status=$?
+cp *.xyz *.log *.txt *.json *.grid *.qrs *.pdb *.rst *.top *.trj *.out $SLURM_SUBMIT_DIR 2>/dev/null || :
+return "$status"
+}}
+
+trap cleanup EXIT
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
+set -e
+
+if ! command -v module >/dev/null 2>&1; then
+  source /etc/profile.d/modules.sh
+fi
+module load python >/dev/null 2>&1 || true
+
+export OMP_NUM_THREADS=1
+export COMEX_MAX_NB_OUTSTANDING=6
+export FI_CXI_RX_MATCH_MODE=hybrid
+export COMEX_EAGER_THRESHOLD=16384
+export FI_CXI_RDZV_THRESHOLD=16384
+export FI_CXI_OFLOW_BUF_COUNT=6
+export MPICH_SMP_SINGLE_COPY_MODE=CMA
+
+mkdir -p {scratch}/ptmpsi_nwchem_${{SLURM_JOB_ID}}
+cd {scratch}/ptmpsi_nwchem_${{SLURM_JOB_ID}}
+"""
+
 slurm_header["Frontier"] = """#!/bin/bash
 #SBATCH --account={account}
 #SBATCH --time={time}
@@ -724,6 +770,25 @@ mpirun -np $SLURM_NTASKS --bind-to none nwchem prepare.nw > prepare.log
 cleanup
 """
 
+qmmm_slurm["Perlmutter"] = """
+cat <<EOF >nwchemrc
+ffield amber
+amber_1 /opt/nwchem/src/data/amber_s/
+amber_2 /opt/nwchem/src/data/amber_q/
+amber_3 /opt/nwchem/src/data/amber_x/
+amber_4 /opt/nwchem/src/data/amber_u/
+spce /opt/nwchem/src/data/solvents/spce.rst
+EOF
+
+cp ${{SLURM_SUBMIT_DIR}}/*.frg .
+cp ${{SLURM_SUBMIT_DIR}}/{complex} .
+cp ${{SLURM_SUBMIT_DIR}}/prepare.nw .
+
+srun -N $SLURM_NNODES -n $SLURM_NTASKS --cpu-bind=cores shifter --module=mpich nwchem prepare.nw > prepare.log
+
+cleanup
+"""
+
 qmmm_slurm["Frontier"] = """
 cat <<EOF >nwchemrc
 ffield amber
@@ -770,6 +835,7 @@ runsingularity = {}
 runsingularity['Tahoma'] = "srun --mpi=pmi2 -N $SLURM_NNODES -n $SLURM_NPROCS apptainer exec --bind {scratch},$NWCHEM_BASIS_LIBRARY $NWBIN nwchem {name}.nw > {name}.log\n\n"
 runsingularity['Frontier'] = "srun -N $SLURM_NNODES -n $SLURM_NPROCS apptainer exec --bind $BINDS --workdir `pwd` $NWBIN nwchem {name}.nw > {name}.log\n\n"
 runsingularity['DECEPTION'] = "mpirun -np $SLURM_NTASKS --bind-to none nwchem {name}.nw > {name}.log\n\n"
+runsingularity['Perlmutter'] = "srun -N $SLURM_NNODES -n $SLURM_NTASKS --cpu-bind=cores shifter --module=mpich nwchem {name}.nw > {name}.log\n\n"
 runsingularity['Polaris'] = "mpiexec -hostfile $PBS_NODEFILE -n ${{NTOTRANKS}} -ppn ${{NRANKS_PER_NODE}} --depth=${{NDEPTH}} --cpu-bind=core $NWBIN {name}.nw > {name}.log\n\n"
 runsingularity_prefix = {}
 runsingularity_prefix_tahoma = "srun --mpi=pmi2 -N $SLURM_NNODES -n $SLURM_NPROCS apptainer exec --bind {scratch},$NWCHEM_BASIS_LIBRARY $NWBIN nwchem"

@@ -18,7 +18,7 @@ import argparse
 import re
 import sys
 
-LAUNCHER = re.compile(r"\b(?:srun|mpirun|mpiexec|flux run)\b[^|;]*?(?=\bgmx(?:_mpi)?\b)")
+LAUNCHER = re.compile(r"\b(?:srun|mpirun|mpiexec|flux run|shifter)\b[^|;]*?(?=\bgmx(?:_mpi)?\b)")
 GPU_FLAGS = [
     r"-gpu_id\s+\S+", r"-gputasks\s+\S+", r"-nb\s+gpu", r"-pme\s+gpu",
     r"-npme\s+\d+", r"-bonded\s+gpu", r"-update\s+gpu",
@@ -57,7 +57,7 @@ def main():
     for raw in open(args.sbatch).read().splitlines():
         raw = raw.strip()
         gromacs = re.match(
-            r"^(echo\b.*\|\s*)?(?:srun|mpirun|mpiexec|flux run|gmx(?:_mpi)?)\b", raw
+            r"^(echo\b.*\|\s*)?(?:srun|mpirun|mpiexec|flux run|shifter|gmx(?:_mpi)?)\b", raw
         ) and re.search(r"\bgmx(?:_mpi)?\s+\w+\b", raw)
         keep = raw.startswith(("perl -0pi", "sed -i '/; Include water topology")) or gromacs
         if keep:

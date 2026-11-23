@@ -211,19 +211,49 @@ tahoma = Machine(name="Tahoma",
         scratchdir="/big_scratch")
 tahoma.partitions["normal"].default = True
 
+# NERSC Perlmutter (LBNL). GROMACS and NWChem run via NERSC Shifter containers
+# (`docker:nersc/gromacs:23.2` and `ghcr.io/nwchemgit/nwchem-720.nersc.mpich4.mpi-pr:latest`).
+# Do not run `module purge` in Perlmutter templates because it strips Cray PrgEnv.
+def _perlmutter_gromacs(ntasks, nthreads, ngpus):
+    container = "shifter --module=cuda-mpich" if ngpus > 0 else "shifter --module=mpich"
+    return {
+        "gromacs": {
+            "gmx": "gmx_mpi",
+            "container": container,
+            "ntasks": ntasks,
+            "nthreads": nthreads,
+            "ngpus": ngpus,
+        }
+    }
+
 perlmutter = Machine(name="Perlmutter",
         partitions={
-            "regular": Partition(name="regular", memory=0, ncpus=64,
-                              ngpus=0, maxtime=48, maxnode=10),
-            "preempt": Partition(name="preempt", memory=0, ncpus=64,
-                              ngpus=0, maxtime=48, maxnode=128),
-            "shared": Partition(name="shared", memory=0, ncpus=64,
-                              ngpus=0, maxtime=48, maxnode=0.5)
+            "regular": Partition(name="regular", memory=256, ncpus=128,
+                              ngpus=4, maxtime=48, maxnode=128,
+                              options=_perlmutter_gromacs(4, 32, 4)),
+            "debug": Partition(name="debug", memory=256, ncpus=128,
+                              ngpus=4, maxtime=0.5, maxnode=8,
+                              options=_perlmutter_gromacs(4, 32, 4)),
+            "preempt": Partition(name="preempt", memory=256, ncpus=128,
+                              ngpus=4, maxtime=48, maxnode=128,
+                              options=_perlmutter_gromacs(4, 32, 4)),
+            "shared": Partition(name="shared", memory=128, ncpus=64,
+                              ngpus=2, maxtime=48, maxnode=1,
+                              options=_perlmutter_gromacs(1, 32, 1)),
+            "cpu_regular": Partition(name="regular", memory=512, ncpus=256,
+                              ngpus=0, maxtime=48, maxnode=256,
+                              options=_perlmutter_gromacs(16, 16, 0)),
+            "cpu_debug": Partition(name="debug", memory=512, ncpus=256,
+                              ngpus=0, maxtime=0.5, maxnode=8,
+                              options=_perlmutter_gromacs(16, 16, 0)),
+            "cpu_preempt": Partition(name="preempt", memory=512, ncpus=256,
+                              ngpus=0, maxtime=48, maxnode=128,
+                              options=_perlmutter_gromacs(16, 16, 0)),
+            "cpu_shared": Partition(name="shared", memory=256, ncpus=128,
+                              ngpus=0, maxtime=48, maxnode=1,
+                              options=_perlmutter_gromacs(4, 16, 0)),
             },
-        modules={"apptainer": "apptainer/1.2.5",
-                 "gcc": "gcc/11.2.0",
-                 "python": "cray-python/3.11.5",
-                 "openmpi": "openmpi/5.0.3"},
+        modules={"python": "python/3.13-26.11.0"},
         scratchdir="$SCRATCH")
 perlmutter.partitions["regular"].default = True
 
@@ -363,7 +393,14 @@ class Slurm:
         self.ngpus = kwargs.pop("ngpus", _partition.ngpus)
         if self.ngpus > _partition.ngpus:
             raise KeyError(f"Partition '{self.partition}' does not have '{self.ngpus}' GPUs available")
-        self.gpuline = f"#SBATCH --gres=gpu:{self.ngpus}" if self.ngpus > 0 else "" 
+        if self.machine.name == "Perlmutter":
+            self.gpuline = f"#SBATCH --gpus-per-node={self.ngpus}" if self.ngpus > 0 else ""
+            self.constraint = kwargs.pop("constraint", "gpu" if self.ngpus > 0 else "cpu")
+            self.gpu_env = "export GMX_ENABLE_DIRECT_GPU_COMM=true\n" if self.ngpus > 0 else ""
+        else:
+            self.gpuline = f"#SBATCH --gres=gpu:{self.ngpus}" if self.ngpus > 0 else ""
+            self.constraint = kwargs.pop("constraint", "")
+            self.gpu_env = ""
 
         self.ncpus = kwargs.pop("ntasks", _partition.ncpus)
         if self.ncpus > _partition.ncpus:
@@ -382,13 +419,13 @@ class Slurm:
         self.time = f"{hours:02}:{minutes:02}:{seconds:02}"
 
         self.account = kwargs.pop("account", self.machine.default_account())
-        if self.machine.name == "DECEPTION" and (
+        if self.machine.name in ("DECEPTION", "Perlmutter") and (
             self.account is None
             or not str(self.account).strip()
             or str(self.account).strip() == "XXXX"
         ):
             raise ValueError(
-                "Deception requires an explicit Slurm account (pass account='<project>'); 'XXXX' is not allowed"
+                f"{self.machine.name} requires an explicit Slurm account (pass account='<project>'); 'XXXX' is not allowed"
             )
 
         self.nnodes  = kwargs.pop("nnodes", 1)
@@ -428,6 +465,8 @@ class Slurm:
                 }
         self.options_dictionary["ngpus"] = self.ngpus
         self.options_dictionary["gpuline"] = self.gpuline
+        self.options_dictionary["constraint"] = self.constraint
+        self.options_dictionary["gpu_env"] = self.gpu_env
 
 
         self.header = self._header_template.format(**self.options_dictionary)
